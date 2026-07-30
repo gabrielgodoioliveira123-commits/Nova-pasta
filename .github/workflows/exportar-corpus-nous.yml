@@ -1,0 +1,96 @@
+name: Exportar corpus web do Círculo Nous
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exportar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Baixar repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-crawl.txt
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-crawl.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Exportar páginas públicas internas
+        run: python tools/run_crawl_nous_urls.py
+
+      - name: Preparar arquivos com teto inferior a 20 MB
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json, shutil, zipfile
+
+          source = Path('nous_corpus_web')
+          out = Path('artifacts')
+          out.mkdir(exist_ok=True)
+          main_zip = Path('CORPUS_WEB_CIRCULO_DE_ESTUDOS_NOUS.zip')
+          ceiling = 19_000_000
+          target_raw = 14_000_000
+
+          if main_zip.exists() and main_zip.stat().st_size <= ceiling:
+              shutil.copy2(main_zip, out / main_zip.name)
+          else:
+              files = [p for p in sorted(source.rglob('*')) if p.is_file()]
+              groups, current, size = [], [], 0
+              for path in files:
+                  n = path.stat().st_size
+                  if current and size + n > target_raw:
+                      groups.append(current)
+                      current, size = [], 0
+                  current.append(path)
+                  size += n
+              if current:
+                  groups.append(current)
+              for i, group in enumerate(groups, 1):
+                  zpath = out / f'CORPUS_WEB_CIRCULO_DE_ESTUDOS_NOUS_PARTE_{i:02d}.zip'
+                  with zipfile.ZipFile(zpath, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+                      for path in group:
+                          zf.write(path, arcname=path.as_posix())
+
+          for name in ['00_INDICE_GERAL.html', '03_MAPA_DE_URLS.csv', '04_RELATORIO_DE_COBERTURA.html', '05_MANIFESTO.json', 'LEIA-ME.txt']:
+              path = source / name
+              if path.exists():
+                  shutil.copy2(path, out / name)
+
+          report = {
+              'arquivos': [
+                  {'nome': p.name, 'bytes': p.stat().st_size}
+                  for p in sorted(out.iterdir()) if p.is_file()
+              ],
+              'teto_bytes': ceiling,
+          }
+          (out / 'TAMANHOS_DOS_ARQUIVOS.json').write_text(
+              json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          oversized = [p for p in out.iterdir() if p.is_file() and p.stat().st_size > ceiling]
+          if oversized:
+              raise SystemExit('Arquivo acima do teto: ' + ', '.join(f'{p.name}={p.stat().st_size}' for p in oversized))
+          print(json.dumps(report, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Publicar pacote para download
+        uses: actions/upload-artifact@v4
+        with:
+          name: corpus-web-circulo-nous
+          path: artifacts/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
